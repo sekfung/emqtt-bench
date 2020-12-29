@@ -67,7 +67,9 @@
          {ws, undefined, "ws", {boolean, false},
           "websocket transport"},
          {ifaddr, undefined, "ifaddr", string,
-          "local ipaddress or interface address"}
+          "local ipaddress or interface address"},
+          {dynamic_passwd, undefined, "dynamic_passwd", {boolean, false},
+            "aliyun iot dynamic password mode"}
         ]).
 
 -define(SUB_OPTS,
@@ -105,7 +107,9 @@
          {ws, undefined, "ws", {boolean, false},
           "websocket transport"},
          {ifaddr, undefined, "ifaddr", string,
-          "local ipaddress or interface address"}
+          "local ipaddress or interface address"},
+          {dynamic_passwd, undefined, "dynamic_passwd", {boolean, false},
+            "aliyun iot dynamic password mode"}
         ]).
 
 -define(CONN_OPTS, [
@@ -137,7 +141,9 @@
          {keyfile, undefined, "keyfile", string,
           "client private key for authentication, if required by server"},
          {ifaddr, undefined, "ifaddr", string,
-          "local ipaddress or interface address"}
+          "local ipaddress or interface address"},
+         {dynamic_passwd, undefined, "dynamic_passwd", {boolean, false},
+          "aliyun iot dynamic password mode"}
         ]).
 
 -define(TAB, ?MODULE).
@@ -299,11 +305,17 @@ run(Parent, N, PubSub, Opts) ->
 	timer:sleep(proplists:get_value(interval, Opts)),
 	run(Parent, N-1, PubSub, Opts).
 
-connect(Parent, N, PubSub, Opts) ->
+connect(Parent, N, PubSub, Options) ->
     process_flag(trap_exit, true),
     rand:seed(exsplus, erlang:timestamp()),
-    ClientId = client_id(PubSub, N, Opts),
-    MqttOpts = [{client_id, ClientId},
+    ClientId = client_id(PubSub, N, Options),
+    Opts = case proplists:get_value(dynamic_passwd, Options) of
+                true ->
+                  reset_opts(N,  ClientId, Options);
+                _ ->
+                  Options
+              end,
+    MqttOpts = [{clientid, ClientId},
                 {tcp_opts, tcp_opts(Opts)},
                 {ssl_opts, ssl_opts(Opts)}
                | mqtt_opts(Opts)],
@@ -311,7 +323,7 @@ connect(Parent, N, PubSub, Opts) ->
                   conn -> [{force_ping, true} | MqttOpts];
                   _ -> MqttOpts
                 end,
-    AllOpts  = [{seq, N}, {client_id, ClientId} | Opts],
+    AllOpts  = [{seq, N}, {clientid, ClientId} | Opts],
 	{ok, Client} = emqtt:start_link(MqttOpts1),
     ConnRet = case proplists:get_bool(ws, Opts) of
                   true  -> 
@@ -333,6 +345,13 @@ connect(Parent, N, PubSub, Opts) ->
         {error, Error} ->
             io:format("client(~w): connect error - ~p~n", [N, Error])
     end.
+
+reset_opts(N,  ClientId,  Opts) ->
+   UserName = gen_dynamic_username(N, "perf_test"),
+   Opts1 = lists:keystore(username, 1, Opts, {username, UserName}),
+   Password = gen_dynamic_password(lists:flatten(binary_to_list(ClientId)), lists:flatten(UserName), lists:flatten(integer_to_list(N))),
+   lists:keystore(password, 1, Opts1, {password, Password}).
+
 
 loop(Parent, N, Client, PubSub, Opts) ->
     receive
@@ -444,8 +463,33 @@ client_id(PubSub, N, Opts) ->
         IfAddr    ->
             IfAddr
     end,
-    list_to_binary(lists:concat([Prefix, "_bench_", atom_to_list(PubSub),
-                                    "_", N, "_", rand:uniform(16#FFFFFFFF)])).
+    ClientId =
+    case proplists:get_value(dynamic_passwd, Opts) of
+%%      11111|securemode=3,timestamp=2524608000000,signmethod=hmacsha1|
+       true ->
+%%         TimeStamp = lists:flatten(erlang:timestamp()),
+         list_to_binary(lists:concat([N,"|securemode=3,timestamp=2524608000000,signmethod=hmacsha1|"]));
+       _ ->
+         list_to_binary(lists:concat([Prefix, "_bench_", atom_to_list(PubSub),
+           "_", N, "_", rand:uniform(16#FFFFFFFF)]))
+    end,
+    ClientId.
+
+
+gen_dynamic_username(DeviceName, ProductKey) ->
+  lists:concat([DeviceName, "&", ProductKey]).
+
+gen_dynamic_password(ClientId, UserName, DeviceSecret) ->
+  ClientIdResult = string:tokens(ClientId, "|"),
+  IMEI = lists:nth(1, ClientIdResult),
+  DeviceNameAndProductKeyResult = string:tokens(UserName, "&"),
+  DeviceName = lists:nth(1, DeviceNameAndProductKeyResult),
+  ProductKey = lists:nth(2, DeviceNameAndProductKeyResult),
+  TimeStampResult = lists:nth(2, string:tokens(lists:nth(2, ClientIdResult), ",")),
+  TimeStamp = lists:nth(2, string:tokens(TimeStampResult, "=")),
+  WaitingSign = io_lib:format("clientId~sdeviceName~sproductKey~stimestamp~s", [IMEI, DeviceName, ProductKey, TimeStamp]),
+  <<Mac:160/integer>> = crypto:hmac(sha, list_to_binary(DeviceSecret), list_to_binary(WaitingSign)),
+  string:to_lower(lists:flatten(integer_to_list(Mac, 16))).
 
 topics_opt(Opts) ->
     Topics = topics_opt(Opts, []),
